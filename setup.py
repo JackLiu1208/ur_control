@@ -23,7 +23,6 @@ setup(
     entry_points={
         'console_scripts': [
             'run_waypoints = ur_control.examples.run_waypoints:main',
-            'control_gui = ur_control.examples.control_gui:main',
             'monitor_state = ur_control.examples.monitor_state:main',
             'gripper_demo = ur_control.examples.gripper_demo:main',
         ],
