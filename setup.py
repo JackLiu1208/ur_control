@@ -25,6 +25,11 @@ setup(
             'run_waypoints = ur_control.examples.run_waypoints:main',
             'monitor_state = ur_control.examples.monitor_state:main',
             'gripper_demo = ur_control.examples.gripper_demo:main',
+            'test_trajectory_interpolator = ur_control.examples.test_trajectory_interpolator:main',
+            'test_analytic_ik = ur_control.examples.test_analytic_ik:main',
+            'dp_control_ros2 = ur_control.examples.dp_control_ros2:main',
+            'dp_control_rtde = ur_control.examples.dp_control_rtde:main',
+            'analyze_trajectory = ur_control.examples.analyze_trajectory:main',
         ],
     },
 )

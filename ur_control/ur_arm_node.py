@@ -20,6 +20,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.time import Time as RclpyTime
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from builtin_interfaces.msg import Duration
 from action_msgs.msg import GoalStatus
@@ -30,7 +31,7 @@ from control_msgs.action import FollowJointTrajectory, GripperCommand
 from geometry_msgs.msg import PoseStamped, Pose
 from shape_msgs.msg import SolidPrimitive
 from moveit_msgs.action import MoveGroup
-from moveit_msgs.srv import GetCartesianPath
+from moveit_msgs.srv import GetCartesianPath, GetPositionIK
 from moveit_msgs.msg import (
     MotionPlanRequest,
     PlanningOptions,
@@ -40,10 +41,12 @@ from moveit_msgs.msg import (
     BoundingVolume,
     MoveItErrorCodes,
     RobotState,
+    PositionIKRequest,
 )
 from tf2_ros import Buffer, TransformListener, TransformException
 
 from ur_control.pose_utils import rotate_vector_by_quaternion, rotation_vector_to_quaternion
+from ur_control import analytic_ik
 
 # =============================================================================
 # 可修改變數 (Configuration) — 依你的機器人 / driver 設定調整
@@ -295,15 +298,30 @@ class URArmNode(Node):
         self.gripper_max_effort = gripper_max_effort
 
         self._latest_joint_state = None
+        # 每收到一次 /joint_states 就 +1。純粹的健康度診斷用：拿兩個時間點的差
+        # 除以經過時間，就是這個 subscription 實際被服務的頻率——直接證實/推翻
+        # 「背景 executor 有沒有真的在跑」，不用猜測。
+        self.joint_state_message_count = 0
 
         self._jtc_action_client = ActionClient(
             self, FollowJointTrajectory, f"{controller_name}/follow_joint_trajectory")
         self._move_group_action_client = ActionClient(self, MoveGroup, move_action_name)
         self._cartesian_path_client = self.create_client(
             GetCartesianPath, "compute_cartesian_path")
+        self._ik_client = self.create_client(GetPositionIK, "compute_ik")
         self._gripper_action_client = ActionClient(self, GripperCommand, gripper_action_name)
+        # /joint_states 是高頻感測資料（driver 端通常 500Hz），用 RELIABLE+depth 10
+        # 這種預設 QoS 在訊息處理跟不上時會累積 backlog、越補越舊；BEST_EFFORT+depth 1
+        # 才是這種「只要最新值、不要求每一筆都送達」的資料該用的設定，跟 RELIABLE
+        # publisher 相容（DDS QoS 相容規則允許 BEST_EFFORT subscriber 接 RELIABLE
+        # publisher）。
+        joint_state_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
         self._joint_state_sub = self.create_subscription(
-            JointState, joint_states_topic, self._joint_state_callback, 10)
+            JointState, joint_states_topic, self._joint_state_callback, joint_state_qos)
 
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
@@ -330,6 +348,7 @@ class URArmNode(Node):
 
     def _joint_state_callback(self, msg: JointState):
         self._latest_joint_state = msg
+        self.joint_state_message_count += 1
 
     def get_current_joint_positions(self, timeout_sec: float = 5.0):
         """Return current joint positions (list, ordered as self.joint_names),
@@ -385,6 +404,32 @@ class URArmNode(Node):
         t = transform.transform.translation
         r = transform.transform.rotation
         return self._tip_pose_to_tcp_pose((t.x, t.y, t.z), (r.x, r.y, r.z, r.w))
+
+    def get_current_tcp_pose_analytic(self):
+        """跟 get_current_tcp_pose() 一樣的回傳格式，但不查 TF，直接用目前快取的
+        /joint_states（self._latest_joint_state）算 FK（ur_control.analytic_ik，
+        微秒等級）。
+
+        高頻路徑請用這個，不要用 TF 版本：TF 的 base_link->tip_link transform
+        只有在 TransformListener 內部的 /tf subscription callback 被 executor
+        服務到的時候才會前進，如果控制迴圈是自己手動 rclpy.spin_once() 或背景
+        executor 沒有確實在跑，TF 會遠遠落後於 /joint_states 實際的發布頻率
+        （這是實測踩過的坑：曾經量到 TF 版本的量測路徑只有 1-2Hz 有效更新，
+        即使 /joint_states 本身是 500Hz）。這個方法完全不依賴 TF/executor 排程，
+        只要 self._latest_joint_state 是新的，這裡算出來的就是新的。
+
+        Returns ((x, y, z), (qx, qy, qz, qw)) or None（還沒收到 /joint_states，
+        或收到的訊息缺關節名稱）。"""
+        if self._latest_joint_state is None:
+            return None
+        name_to_position = dict(zip(
+            self._latest_joint_state.name, self._latest_joint_state.position))
+        try:
+            joint_positions = [name_to_position[name] for name in self.joint_names]
+        except KeyError:
+            return None
+        tip_position, tip_orientation = analytic_ik.forward_kinematics(joint_positions)
+        return self._tip_pose_to_tcp_pose(tip_position, tip_orientation)
 
     def wait_for_tcp_pose(self, timeout_sec: float = 5.0):
         """Blocking version of get_current_tcp_pose(): spins until the
@@ -625,6 +670,85 @@ class URArmNode(Node):
 
         return self.move_joint_trajectory(trajectory, wait=wait,
                                            goal_time_tolerance=goal_time_tolerance)
+
+    def compute_ik(self, position_xyz, orientation_xyzw, seed_positions=None,
+                    timeout_sec: float = 0.1):
+        """Solve IK for a single TCP pose (tip_link + tcp_offset_xyz), via
+        MoveIt's /compute_ik service — this does NOT move the robot, it just
+        returns a joint solution (list, ordered as self.joint_names) or None
+        if no solution / service unavailable.
+
+        Meant for batch use (solve a whole model action-chunk once, up
+        front, then stream the results through a local interpolator) —
+        each call is still one ROS service round-trip (tens of ms typically),
+        far too slow to call once per high-rate control tick.
+
+        seed_positions: joint positions (ordered as self.joint_names) to seed
+        the solver near, so consecutive chunk points resolve to the same arm
+        configuration branch instead of jumping between IK solutions. Falls
+        back to the robot's current joint state if not given."""
+        if not self._ik_client.wait_for_service(timeout_sec=self.server_timeout):
+            self.get_logger().error("等不到 compute_ik service")
+            return None
+
+        tip_position, tip_orientation = self._tcp_pose_to_tip_pose(position_xyz, orientation_xyzw)
+
+        if seed_positions is not None:
+            seed_state = JointState()
+            seed_state.name = list(self.joint_names)
+            seed_state.position = list(seed_positions)
+        elif self._latest_joint_state is not None:
+            seed_state = self._latest_joint_state
+        else:
+            self.get_logger().error("沒有 seed_positions，也還沒收到 /joint_states，無法求解 IK")
+            return None
+
+        pose_stamped = PoseStamped()
+        pose_stamped.header.frame_id = self.base_link
+        pose_stamped.pose.position.x = float(tip_position[0])
+        pose_stamped.pose.position.y = float(tip_position[1])
+        pose_stamped.pose.position.z = float(tip_position[2])
+        pose_stamped.pose.orientation.x = float(tip_orientation[0])
+        pose_stamped.pose.orientation.y = float(tip_orientation[1])
+        pose_stamped.pose.orientation.z = float(tip_orientation[2])
+        pose_stamped.pose.orientation.w = float(tip_orientation[3])
+
+        request = GetPositionIK.Request()
+        request.ik_request = PositionIKRequest()
+        request.ik_request.group_name = self.move_group_name
+        request.ik_request.robot_state = RobotState(joint_state=seed_state, is_diff=False)
+        request.ik_request.pose_stamped = pose_stamped
+        request.ik_request.avoid_collisions = True
+        request.ik_request.timeout = _seconds_to_duration(timeout_sec)
+
+        response_future = self._ik_client.call_async(request)
+        rclpy.spin_until_future_complete(self, response_future, timeout_sec=self.server_timeout)
+        response = response_future.result()
+        if response is None or response.error_code.val != MoveItErrorCodes.SUCCESS:
+            error_code = response.error_code.val if response else None
+            self.get_logger().error(
+                f"compute_ik 失敗: error_code={error_code} "
+                f"({_moveit_error_code_to_str(error_code) if response else 'no response'})")
+            return None
+
+        name_to_position = dict(zip(
+            response.solution.joint_state.name, response.solution.joint_state.position))
+        return [name_to_position[name] for name in self.joint_names]
+
+    def compute_ik_analytic(self, position_xyz, orientation_xyzw, seed_positions):
+        """跟 compute_ik() 一樣的介面（TCP offset 處理相同），但用
+        ur_control.analytic_ik（PickNik ur-analytic-ik，IKFast 閉式解），完全
+        in-process、微秒等級，不呼叫 MoveIt service。適合高頻控制迴圈路徑：
+        compute_ik() 每次呼叫是一次 ROS service round-trip（十幾到幾十 ms），
+        一個 chunk 呼叫十幾次會在控制迴圈裡造成明顯的 dt 尖峰，這個方法不會。
+
+        跟 compute_ik() 的重要差異：**不做碰撞檢查**（需要 MoveIt，跟這個方法
+        存在的目的矛盾），而且 seed_positions 是必填（UR 一個姿態最多 8 組解，
+        沒有 seed 沒辦法決定要哪一組）。回傳 None 表示無解，或者解通過內部
+        round-trip 驗證失敗（見 analytic_ik.solve()），呼叫端應該當作「這個點
+        求不出來」處理，不要送出去。"""
+        tip_position, tip_orientation = self._tcp_pose_to_tip_pose(position_xyz, orientation_xyzw)
+        return analytic_ik.solve(tip_position, tip_orientation, seed_positions)
 
     def move_pose_waypoints(self, waypoints, wait: bool = True,
                              eef_step: float = None, jump_threshold: float = None,
