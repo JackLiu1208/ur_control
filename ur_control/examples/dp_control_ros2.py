@@ -19,7 +19,7 @@ from ur_control.ur_arm_node import TCP_OFFSET_ROBOTIQ_2F140
 # =============================================================================
 # 選要測哪一種軌跡
 # =============================================================================
-TRAJECTORY_TYPE = "figure_eight"   
+TRAJECTORY_TYPE = "six_axis_circle"   
 # "six_axis_circle" / "figure_eight" / "step_waypoints" / "line_back_and_forth"
 
 # 目前手臂上裝的是 25cm 的 Robotiq 2F-140 夾爪；如果拆掉夾爪、只用裸法蘭面測試，
@@ -199,8 +199,8 @@ def _build_inference_fn(trajectory_type: str, action_step_dt: float, prediction_
     if trajectory_type == "six_axis_circle":
         return _SixAxisCoupledCircleInference(
             radius_m=0.05, xy_period_s=5,
-            z_amplitude_m=0.05, z_period_s=10,
-            rot_amplitude_deg=6.0, rx_period_s=10, ry_period_s=10, rz_period_s=10,
+            z_amplitude_m=0.025, z_period_s=10,
+            rot_amplitude_deg=6.0, rx_period_s=10, ry_period_s=10, rz_period_s=20,
             action_step_dt=action_step_dt, prediction_horizon=prediction_horizon)
     if trajectory_type == "figure_eight":
         return _FigureEightInference(
@@ -232,7 +232,7 @@ def main(args=None):
         home_joint_positions=[-1.5708, -1.0708, -2.1708, -1.4708, 1.5708, 0.0],
         home_move_time_seconds=4.0,
 
-        control_hz=120.0,
+        control_hz=250.0,
         prediction_horizon=16,
         action_horizon=8,
         action_step_dt=0.1,
@@ -241,7 +241,7 @@ def main(args=None):
         max_rot_speed=3.33,     # 上限 3.33rad/s (191deg/s)
 
         # "joint"（預設、已驗證）或 "cartesian"（逐 tick 現場解 IK，見 README）。
-        control_space="cartesian",
+        control_space="joint",
 
         # cartesian 模式必填的關節角速度/加速度上限，安全關鍵。以下數字**還沒有
         # 像 max_pos_speed/max_rot_speed 那樣實測確認過**，用之前先核對教導器

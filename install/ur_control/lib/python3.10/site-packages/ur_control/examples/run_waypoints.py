@@ -37,8 +37,8 @@ NODE_NAME = "ur_waypoint_control_node"  # 這支程式使用的 node 名稱
 
 # 手臂移動速度/加速度縮放 (0~1)，套用到本程式所有移動呼叫
 # （若某次呼叫需要不同速度，也可以在該次呼叫用 velocity_scaling=... 個別覆寫）
-SPEED_SCALING = 0.5
-ACCELERATION_SCALING = 0.3
+SPEED_SCALING = 1
+ACCELERATION_SCALING = 1
 
 
 def main(args=None):
@@ -88,9 +88,8 @@ def main(args=None):
         # ------------------------------------------------------------------
 
         # 範例 1：關節空間單點目標（相對目前姿態的小幅度移動，示範用）
-        # target = list(joint_positions)
-        # target[5] += 0.2  # wrist_3 +0.2 rad
-        # arm.move_joint(target, time_from_start=3.0)
+        target = [-1.5708, -0.3665, -2.7052, -0.1, 1.5708, 0.0]
+        arm.move_joint(target, time_from_start=4.0)
 
         # 範例 2：關節空間多點軌跡（一次送出多個路徑點）
         # arm.move_joint_waypoints([
@@ -133,27 +132,27 @@ def main(args=None):
         # 連續軌跡，而是每個點各自呼叫 move_pose_linear() 單點移動，等這個點真的執行
         # 完成（wait=True）才送下一個點。之後真的接 DP 模型時，把 ee_trajectory 這個
         # list 換成「跟模型要下一個點」的呼叫即可，迴圈邏輯不用改。
-        ee_trajectory = [
-            # (x, y, z, rx, ry, rz)  教導器 Base 座標系
-            (-0.185, -0.353, 0.356, 2.8754, 1.2564, 0.0358),
-            (-0.021, -0.352, 0.356, 2.8860, 1.2600, 0.0320),
-            (-0.021, -0.432, 0.306, 2.8860, 1.2600, 0.0320),
-            (-0.241, -0.432, 0.355, 2.8860, 1.2600, 0.0320),
-        ]
-        for i, (x, y, z, rx, ry, rz) in enumerate(ee_trajectory):
-            # 模型輸出的末端點位置/姿態是教導器 Base 座標系，先轉成 base_link 座標系再送給 move_pose_linear()
-            # 真的會用到的只有以下兩行，其他只是示範用的 log 顯示。
-            arm.get_logger().info(
-                f"action target: xyz=({x:.4f}, {y:.4f}, {z:.4f}) ,rxryrz=({rx:.4f}, {ry:.4f}, {rz:.4f})"
-            )
-            position, orientation = ur_base_to_base_link((x, y, z), (rx, ry, rz))
-            success = arm.move_pose_linear(
-                position, orientation, velocity_scaling=SPEED_SCALING, wait=True
-            )
+        # ee_trajectory = [
+        #     # (x, y, z, rx, ry, rz)  教導器 Base 座標系
+        #     (-0.185, -0.353, 0.356, 2.8754, 1.2564, 0.0358),
+        #     (-0.021, -0.352, 0.356, 2.8860, 1.2600, 0.0320),
+        #     (-0.021, -0.432, 0.306, 2.8860, 1.2600, 0.0320),
+        #     (-0.241, -0.432, 0.355, 2.8860, 1.2600, 0.0320),
+        # ]
+        # for i, (x, y, z, rx, ry, rz) in enumerate(ee_trajectory):
+        #     # 模型輸出的末端點位置/姿態是教導器 Base 座標系，先轉成 base_link 座標系再送給 move_pose_linear()
+        #     # 真的會用到的只有以下兩行，其他只是示範用的 log 顯示。
+        #     arm.get_logger().info(
+        #         f"action target: xyz=({x:.4f}, {y:.4f}, {z:.4f}) ,rxryrz=({rx:.4f}, {ry:.4f}, {rz:.4f})"
+        #     )
+        #     position, orientation = ur_base_to_base_link((x, y, z), (rx, ry, rz))
+        #     success = arm.move_pose_linear(
+        #         position, orientation, velocity_scaling=SPEED_SCALING, wait=True
+        #     )
 
-            arm.get_logger().info(f"第 {i} 點{'完成' if success else '失敗'}")
-            if not success:
-                break
+        #     arm.get_logger().info(f"第 {i} 點{'完成' if success else '失敗'}")
+        #     if not success:
+        #         break
 
     except KeyboardInterrupt:
         pass
