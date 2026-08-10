@@ -1,0 +1,12 @@
+Metadata-Version: 2.1
+Name: ur-control
+Version: 0.1.0
+Summary: UR arm joint/Cartesian control node sharing the official external-control communication path (FollowJointTrajectory / MoveIt2).
+Home-page: UNKNOWN
+Maintainer: jackliu1017
+Maintainer-email: 804jack@gmail.com
+License: Apache-2.0
+Platform: UNKNOWN
+
+UNKNOWN
+
