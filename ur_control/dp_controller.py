@@ -38,6 +38,7 @@ from geometry_msgs.msg import Point
 from visualization_msgs.msg import Marker
 from controller_manager_msgs.srv import SwitchController
 
+from ur_control import analytic_ik
 from ur_control.ur_arm_node import URArmNode
 from ur_control.trajectory_interpolator import PoseTrajectoryInterpolator, JointTrajectoryInterpolator
 from ur_control.trajectory_logger import TrajectoryLogger
@@ -79,14 +80,38 @@ class DPControlConfig:
 
     # 控制迴圈在哪個空間做 120Hz 插值，"joint"（預設，已驗證）或 "cartesian"
     # （每 tick 現場解 IK）。細節見 README「問題與解決方法」。
-    control_space: str = "cartesian"     # "joint" / "cartesian"
+    control_space: str = "joint"     # "joint" / "cartesian"
 
-    # cartesian 模式專用的關節角速度/加速度上限（rate limiter，見 run() 內的
-    # 實作）——joint 模式不受影響、也不檢查這兩個欄位。安全關鍵，**不提供預設值**
-    # （理由同 home_joint_positions）：必須填你在真實 UR5e 上確認過的數字，
-    # control_space="cartesian" 時沒填會直接 raise。細節見 README。
+    # 兩種 control_space 都會用到的關節角速度上限。joint 模式用來夾
+    # joint_interp 排點的時間（IK 在奇異點附近可能讓「Cartesian 移動很小」對應
+    # 到「關節角要轉很大」，只靠 max_pos_speed/max_rot_speed 管不到這個）；也是
+    # 下面 joint_accel_limit 平滑濾波器的速度上限。安全關鍵，**不提供預設值**
+    # （理由同 home_joint_positions）：必須填你在真實 UR5e 上確認過的數字（示
+    # 教器 Installation 找不到就用保守值，不要瞎猜），沒填會直接 raise。細節見
+    # README。
     max_joint_speed: Optional[float] = None          # rad/s，六軸統一上限
-    max_joint_acceleration: Optional[float] = None   # rad/s^2，六軸統一上限
+
+    # 不管 control_space 是哪一種，run() 最後實際發布出去的指令都會經過同一個
+    # 加速度限制的平滑濾波器（見 run() 內的實作），把 joint_interp 在 chunk
+    # 交界處的斜率不連續、cartesian 模式現場解 IK 在奇異點附近的大位移，都收斂
+    # 成速度連續變化的指令——UR 控制器內建一套跟教導器 Installation 設定無關、
+    # 不能調、卻一直在監測「指令變化是否過於突然」的低階保護機制，指令加速度太
+    # 大一樣會觸發 Protective Stop，不是只有速度超過 Installation 上限才會。
+    #
+    # 這個值**不是**教導器上能查到的任何真實規格（找不到才需要這個欄位），是
+    # 純軟體端自選的保守平滑常數，用來壓低「指令」本身的加速度，不代表手臂
+    # 實際動力學上限。安全關鍵，**不提供預設值**：先給保守值（例如 2 rad/s²）
+    # 實測，觀察還會不會跳 Protective Stop，穩定後再視情況調高。
+    joint_accel_limit: Optional[float] = None        # rad/s^2，六軸統一上限
+
+    # 這台手臂出廠校正檔（教導器 Installation -> Calibration 匯出的格式，見
+    # analytic_ik.py「出廠校正」小節）。None（預設）= analytic_ik 用內建的標稱
+    # UR5e 參數，不做校正修正。填了路徑，run() 會在進入串流迴圈前呼叫
+    # analytic_ik.load_calibration()，之後這個 process 裡所有 IK/FK（包含
+    # get_current_tcp_pose_analytic() 等）都會改用校正後的模型。跟其他安全關鍵
+    # 欄位不同：這個沒有校正檔也能正常運作（只是少了 ~1mm 等級的精度），所以
+    # 允許 None 預設值。
+    calibration_file: Optional[Path] = None
 
     # 在真實 UR5e 上量出來的延遲前饋補償（見 README「問題與解決方法」第 3 項）：
     # 控制迴圈查詢 interpolator 用 now + latency_feedforward，而不是 now，補償
@@ -199,11 +224,15 @@ class DPController:
                 "（或是把 enable_homing 設 False，自己保證起始姿態安全）。")
         if cfg.control_space not in ("joint", "cartesian"):
             raise ValueError(f"control_space 必須是 'joint' 或 'cartesian'，收到: {cfg.control_space!r}")
-        if cfg.control_space == "cartesian" and (cfg.max_joint_speed is None or cfg.max_joint_acceleration is None):
+        if cfg.max_joint_speed is None or cfg.joint_accel_limit is None:
             raise ValueError(
-                "control_space='cartesian' 需要 max_joint_speed 跟 max_joint_acceleration"
-                "都明確填值——這是安全關鍵參數，必須是你在真實 UR5e 上確認過的關節角速度/"
-                "加速度上限，沒有預設值可以沿用（理由見 DPControlConfig 這兩個欄位的註解）。")
+                "max_joint_speed 跟 joint_accel_limit 都需要明確填值（joint/cartesian 兩種"
+                "control_space 都要）——這是安全關鍵參數，沒有預設值可以沿用（理由見"
+                "DPControlConfig 這兩個欄位的註解）。")
+
+        if cfg.calibration_file is not None:
+            analytic_ik.load_calibration(cfg.calibration_file)
+            arm.get_logger().info(f"已載入出廠校正檔: {cfg.calibration_file}")
 
         command_publisher = arm.create_publisher(
             Float64MultiArray, f"/{cfg.streaming_controller_name}/commands", 10)
@@ -224,9 +253,18 @@ class DPController:
                     return
 
             joint_positions = arm.get_current_joint_positions()
-            origin_pose = arm.wait_for_tcp_pose(timeout_sec=5.0)
-            if joint_positions is None or origin_pose is None:
-                arm.get_logger().error("讀不到目前關節/末端點狀態，中止")
+            if joint_positions is None:
+                arm.get_logger().error("讀不到目前關節狀態，中止")
+                return
+            # 特意不用 wait_for_tcp_pose()（查 TF）：TF buffer 只要裡面有任何一筆
+            # transform 就會立刻回傳，不保證是剛剛回完 home pose「之後」的新值——
+            # 可能是上一次啟動、甚至更早留下的舊姿態。用跟 joint_positions 同一份
+            # /joint_states 算出來的 analytic FK，才能保證 pose_interp 的起點跟
+            # inference_fn 拿到的 current_tcp_pose、joint_interp 的起點三者一致，
+            # 不會在第一個 replan 就因為起點對不上而跳變。
+            origin_pose = arm.get_current_tcp_pose_analytic()
+            if origin_pose is None:
+                arm.get_logger().error("讀不到目前末端點狀態，中止")
                 return
             origin_position, origin_orientation = origin_pose
             arm.get_logger().info(f"起始位置 [base_link]: {origin_position}")
@@ -256,7 +294,9 @@ class DPController:
             start_time = time.time()
             pose_interp = PoseTrajectoryInterpolator(0.0, origin_position, origin_orientation)
             joint_interp = JointTrajectoryInterpolator(0.0, joint_positions)
-            last_joint_solution = list(joint_positions)
+            last_joint_solution = list(joint_positions)   # 只用來 seed 每次 replan 的 IK 連續性
+            last_published_positions = list(joint_positions)   # 平滑濾波器狀態：實際發布過的位置
+            last_published_velocity = [0.0] * len(joint_positions)   # 平滑濾波器狀態：對應速度
 
             next_replan_time = 0.0
             replan_index = 0
@@ -270,10 +310,8 @@ class DPController:
             measured_trace_points = [origin_position]
             period = 1.0 / cfg.control_hz
             next_tick_time = time.time()
-            # 以下三個只有 control_space="cartesian" 會用到：
-            cartesian_ik_failures_since_log = 0
-            last_joint_velocity = [0.0] * len(joint_positions)   # rad/s，rate limiter 狀態
-            joint_limit_active = False          # 目前這個 tick 是否正被限速/限加速度夾住
+            cartesian_ik_failures_since_log = 0   # 只有 control_space="cartesian" 會用到
+            joint_limit_active = False          # 目前這個 tick 是否正被平滑濾波器夾住
             joint_limit_triggers_since_log = 0
 
             latency_feedforward = min(
@@ -305,7 +343,14 @@ class DPController:
                                     f"[replan {replan_index}] IK 無解，跳過這個點: pos={position}")
                                 continue
                             last_joint_solution = joint_solution
-                            joint_interp.schedule_waypoint(joint_solution, target_time=actual_time, curr_time=now)
+                            # max_joint_speed 一定要傳：actual_time 只是 pose_interp 用
+                            # Cartesian 速度算出來的時間，IK 在接近奇異點/大幅旋轉時可能
+                            # 讓「Cartesian 移動很小」對應到「關節角要轉很大」，沒有這個
+                            # 夾子的話 joint_interp 會照樣把大位移排進很短的時間，實機上
+                            # 就是瞬間高速、觸發保護性停機。
+                            joint_interp.schedule_waypoint(
+                                joint_solution, target_time=actual_time, curr_time=now,
+                                max_joint_speed=cfg.max_joint_speed)
                         # cfg.control_space == "cartesian"：不在這裡解 IK，
                         # pose_interp 排好之後，IK 留給高頻迴圈每個 tick 現場解
                         # （見下面 query_time 那段），這裡只需要排 pose_interp。
@@ -328,66 +373,71 @@ class DPController:
                 commanded_position, commanded_orientation = pose_interp.interpolate(query_time)
 
                 if cfg.control_space == "joint":
-                    target_positions = joint_interp.interpolate(query_time)
+                    raw_target_positions = np.array(joint_interp.interpolate(query_time))
                 else:
                     # cartesian 模式：每個 tick 對 Cartesian 插值出來的目標現場解
-                    # 一次 IK，seed 用上一個 tick 限速後真正送出去的關節角（不是
-                    # IK 原始解，才會貼著手臂實際位置）。解不出來就當這個 tick
-                    # 沒有新目標、速度歸零，失敗次數累計到週期性狀態 log。
+                    # 一次 IK，seed 用上一個 tick 真正發布出去的關節角（平滑濾波器
+                    # 之後的值，不是 IK 原始解），才會貼著手臂實際位置。解不出來
+                    # 就當這個 tick 沒有新目標、沿用上次發布的位置，失敗次數累計
+                    # 到週期性狀態 log。
                     joint_solution = arm.compute_ik_analytic(
-                        commanded_position, commanded_orientation, seed_positions=last_joint_solution)
+                        commanded_position, commanded_orientation, seed_positions=last_published_positions)
                     if joint_solution is None:
                         cartesian_ik_failures_since_log += 1
-                        last_joint_velocity = [0.0] * len(last_joint_velocity)
+                        raw_target_positions = np.array(last_published_positions)
                     else:
-                        # 帶煞車距離的 trapezoidal rate limiter：目標速度用煞車
-                        # 距離公式 v = sqrt(2 * max_joint_acceleration * 剩餘距離)
-                        # 反推（不能只把速度夾在 max_joint_speed，那樣目標接近時
-                        # 會來不及煞車、衝過頭震盪），再跟 max_joint_speed 取小值。
-                        # 真正送出去的指令永遠合法、不超調；追不上的部分就讓它
-                        # 老實落後，不是 bug。
-                        current_positions = np.array(last_joint_solution)
-                        current_velocity = np.array(last_joint_velocity)
-                        raw_target = np.array(joint_solution)
+                        raw_target_positions = np.array(joint_solution)
 
-                        position_error = raw_target - current_positions
-                        braking_speed_limit = np.sqrt(
-                            np.maximum(2.0 * cfg.max_joint_acceleration * np.abs(position_error), 0.0))
-                        target_velocity = np.sign(position_error) * np.minimum(
-                            braking_speed_limit, cfg.max_joint_speed)
+                # 平滑濾波器：不管 target_positions 是 joint_interp 插值出來的
+                # （chunk 交界處斜率可能不連續）還是 cartesian 現場解 IK 出來的
+                # （奇異點附近可能是大位移），實際發布出去的指令都要經過同一組
+                # 速度/加速度上限，兩種 control_space 都適用。速度用煞車距離公式
+                # （v=sqrt(2·a·剩餘距離)）反推，不能只夾速度上限，那樣目標接近時
+                # 會來不及煞車、衝過頭震盪。joint_accel_limit 見 DPControlConfig
+                # 註解——這不是教導器上的規格值，是壓低指令加速度本身的軟體端
+                # 保守常數，UR 控制器不管教導器有沒有對應設定，都會因為指令加速度
+                # 太突然觸發 Protective Stop。
+                current_positions = np.array(last_published_positions)
+                current_velocity = np.array(last_published_velocity)
 
-                        desired_acceleration = (target_velocity - current_velocity) / period
-                        accel_limited_acceleration = np.clip(
-                            desired_acceleration, -cfg.max_joint_acceleration, cfg.max_joint_acceleration)
-                        new_velocity = current_velocity + accel_limited_acceleration * period
-                        new_positions = current_positions + new_velocity * period
+                position_error = raw_target_positions - current_positions
+                braking_speed_limit = np.sqrt(
+                    np.maximum(2.0 * cfg.joint_accel_limit * np.abs(position_error), 0.0))
+                target_velocity = np.sign(position_error) * np.minimum(
+                    braking_speed_limit, cfg.max_joint_speed)
 
-                        # 「有沒有真的被卡住」要看真正套用的速度/加速度是否頂到
-                        # 上限，不能看原始追蹤誤差（誤差/tick 週期換算出來的瞬間
-                        # 需要速度永遠很大，正常追蹤本來就會有，不代表卡到上限）。
-                        speed_saturated_mask = np.abs(target_velocity) >= cfg.max_joint_speed - 1e-6
-                        accel_saturated_mask = (
-                            np.abs(accel_limited_acceleration) >= cfg.max_joint_acceleration - 1e-6)
-                        triggered = bool(np.any(speed_saturated_mask) or np.any(accel_saturated_mask))
-                        if triggered and not joint_limit_active:
-                            # 順便印出卡住的關節 index + 當下 J5 角度：UR 腕部
-                            # 奇異點是 J5≈0（J4/J6 軸線重合），方便事後判斷觸發
-                            # 原因是不是靠近奇異點。
-                            stuck_joints = sorted(set(
-                                np.nonzero(speed_saturated_mask)[0].tolist()
-                                + np.nonzero(accel_saturated_mask)[0].tolist()))
-                            arm.get_logger().warning(
-                                f"[t={now:.2f}s] cartesian 模式頂到關節角速度/加速度上限——被卡住的關節"
-                                f"（0-indexed): {stuck_joints}，此刻 J5(index4)={raw_target[4]:.3f}rad"
-                                f"（越接近 0 越可能是腕部奇異點）；可能是靠近運動學奇異點，也可能只是"
-                                f"這段本來就跑得快，手臂會暫時跟不上目標軌跡")
-                        joint_limit_active = triggered
-                        if triggered:
-                            joint_limit_triggers_since_log += 1
+                desired_acceleration = (target_velocity - current_velocity) / period
+                accel_limited_acceleration = np.clip(
+                    desired_acceleration, -cfg.joint_accel_limit, cfg.joint_accel_limit)
+                new_velocity = current_velocity + accel_limited_acceleration * period
+                new_positions = current_positions + new_velocity * period
 
-                        last_joint_velocity = new_velocity.tolist()
-                        last_joint_solution = new_positions.tolist()
-                    target_positions = last_joint_solution
+                # 「有沒有真的被卡住」要看真正套用的速度/加速度是否頂到上限，不能
+                # 看原始追蹤誤差（誤差/tick 週期換算出來的瞬間需要速度永遠很大，
+                # 正常追蹤本來就會有，不代表卡到上限）。
+                speed_saturated_mask = np.abs(target_velocity) >= cfg.max_joint_speed - 1e-6
+                accel_saturated_mask = (
+                    np.abs(accel_limited_acceleration) >= cfg.joint_accel_limit - 1e-6)
+                triggered = bool(np.any(speed_saturated_mask) or np.any(accel_saturated_mask))
+                if triggered and not joint_limit_active:
+                    # 順便印出卡住的關節 index + 當下 J5 角度：UR 腕部奇異點是
+                    # J5≈0（J4/J6 軸線重合），方便事後判斷觸發原因是不是靠近奇異點。
+                    stuck_joints = sorted(set(
+                        np.nonzero(speed_saturated_mask)[0].tolist()
+                        + np.nonzero(accel_saturated_mask)[0].tolist()))
+                    arm.get_logger().warning(
+                        f"[t={now:.2f}s] 頂到平滑濾波器的關節角速度/加速度上限——被卡住的關節"
+                        f"（0-indexed): {stuck_joints}，此刻 J5(index4)="
+                        f"{raw_target_positions[4]:.3f}rad（越接近 0 越可能是腕部奇異點）；"
+                        f"可能是靠近運動學奇異點，也可能只是這段本來就跑得快，手臂會暫時"
+                        f"跟不上目標軌跡")
+                joint_limit_active = triggered
+                if triggered:
+                    joint_limit_triggers_since_log += 1
+
+                last_published_velocity = new_velocity.tolist()
+                last_published_positions = new_positions.tolist()
+                target_positions = last_published_positions
                 command_publisher.publish(Float64MultiArray(data=[float(v) for v in target_positions]))
                 if logger is not None:
                     logger.log_commanded_sample(now, commanded_position, commanded_orientation)
@@ -426,14 +476,14 @@ class DPController:
                     joint_state_count = arm.joint_state_message_count
                     joint_state_hz = (joint_state_count - last_status_joint_state_count) / status_interval
                     cartesian_ik_status = (
-                        f" | cartesian tick IK 失敗: {cartesian_ik_failures_since_log} 次 | "
-                        f"關節限速觸發: {joint_limit_triggers_since_log} 次"
+                        f" | cartesian tick IK 失敗: {cartesian_ik_failures_since_log} 次"
                         if cfg.control_space == "cartesian" else "")
                     arm.get_logger().info(
                         f"實測串流頻率: 平均 {fps_ema:.1f} Hz / 這 {cfg.status_log_interval_seconds:.0f} "
                         f"秒內最低 {min_instant_fps:.1f} Hz (目標 {cfg.control_hz:.0f} Hz) | "
                         f"/joint_states 實際收到頻率: {joint_state_hz:.1f} Hz（背景 executor 健康度）"
-                        f"{cartesian_ik_status}")
+                        f"{cartesian_ik_status} | 平滑濾波器限速/限加速度觸發: "
+                        f"{joint_limit_triggers_since_log} 次")
                     last_status_log = now
                     last_status_joint_state_count = joint_state_count
                     min_instant_fps = None

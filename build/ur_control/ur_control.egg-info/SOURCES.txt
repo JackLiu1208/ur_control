@@ -19,6 +19,7 @@ ur_control/state_monitor.py
 ur_control/trajectory_interpolator.py
 ur_control/trajectory_logger.py
 ur_control/ur_arm_node.py
+ur_control/config/my_robot_calibration.yaml
 ur_control/examples/__init__.py
 ur_control/examples/analyze_trajectory.py
 ur_control/examples/dp_control_ros2.py

@@ -26,6 +26,8 @@
   <exec_depend>controller_manager_msgs</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-matplotlib</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
   <!-- dp_control_rtde.py also needs the ur_rtde PyPI package (rtde_control /
        rtde_receive), not a ROS package; see README.md for the pip install command -->
   <!-- analytic_ik.py needs the ur-analytic-ik PyPI package (PickNik IKFast closed-form

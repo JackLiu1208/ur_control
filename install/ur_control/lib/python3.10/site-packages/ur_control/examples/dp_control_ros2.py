@@ -9,8 +9,11 @@
 跟「API」。
 """
 
+from pathlib import Path
+
 import numpy as np
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 
 from ur_control.dp_controller import DPControlConfig, DPController
 from ur_control.pose_utils import quaternion_multiply, rotation_vector_to_quaternion
@@ -19,7 +22,7 @@ from ur_control.ur_arm_node import TCP_OFFSET_ROBOTIQ_2F140
 # =============================================================================
 # 選要測哪一種軌跡
 # =============================================================================
-TRAJECTORY_TYPE = "six_axis_circle"   
+TRAJECTORY_TYPE = "six_axis_circle"
 # "six_axis_circle" / "figure_eight" / "step_waypoints" / "line_back_and_forth"
 
 # 目前手臂上裝的是 25cm 的 Robotiq 2F-140 夾爪；如果拆掉夾爪、只用裸法蘭面測試，
@@ -27,6 +30,12 @@ TRAJECTORY_TYPE = "six_axis_circle"
 # 變數。這個值只影響座標轉換（IK/FK 本身不知道 TCP offset 這件事），不會自動
 # 偵測你實際裝了什麼工具，換工具一定要手動改這裡。
 TCP_OFFSET_XYZ = TCP_OFFSET_ROBOTIQ_2F140
+
+# 這台手臂出廠校正檔（教導器 Installation -> Calibration 匯出），讓 analytic_ik
+# 的 IK/FK 貼齊這支手臂實際的運動學模型，而不是 ur_analytic_ik 內建的標稱 UR5e
+# 參數（誤差量級見 analytic_ik.py「出廠校正」小節）。換手臂要換成那支手臂自己的
+# 校正檔（重新從教導器匯出，放到 ur_control/config/ 底下、colcon build 一次）。
+CALIBRATION_FILE = Path(get_package_share_directory("ur_control")) / "config" / "my_robot_calibration.yaml"
 
 
 class _SixAxisCoupledCircleInference:
@@ -198,13 +207,13 @@ class _LineBackAndForthInference:
 def _build_inference_fn(trajectory_type: str, action_step_dt: float, prediction_horizon: int):
     if trajectory_type == "six_axis_circle":
         return _SixAxisCoupledCircleInference(
-            radius_m=0.05, xy_period_s=5,
+            radius_m=0.05, xy_period_s=10,
             z_amplitude_m=0.025, z_period_s=10,
             rot_amplitude_deg=6.0, rx_period_s=10, ry_period_s=10, rz_period_s=20,
             action_step_dt=action_step_dt, prediction_horizon=prediction_horizon)
     if trajectory_type == "figure_eight":
         return _FigureEightInference(
-            amplitude_x_m=0.06, amplitude_y_m=0.06, period_s=5.0,
+            amplitude_x_m=0.06, amplitude_y_m=0.06, period_s=10.0,
             action_step_dt=action_step_dt, prediction_horizon=prediction_horizon)
     if trajectory_type == "step_waypoints":
         return _StepWaypointInference(
@@ -226,13 +235,14 @@ def main(args=None):
         node_name="dp_control_ros2_demo",
 
         tcp_offset_xyz=TCP_OFFSET_XYZ,
+        calibration_file=CALIBRATION_FILE,
 
         # 這個工作站量測過的安全 home pose——通用 UR「手肘向上」姿態，換工作空間
         # 要自己重新確認不會撞到任何東西（見 dp_controller.py 裡的說明）。
-        home_joint_positions=[-1.5708, -1.0708, -2.1708, -1.4708, 1.5708, 0.0],
+        home_joint_positions=[-1.5708, -1.0708, -2.1708, -1.4708, 1.5700, 0.0],
         home_move_time_seconds=4.0,
 
-        control_hz=250.0,
+        control_hz=125.0,
         prediction_horizon=16,
         action_horizon=8,
         action_step_dt=0.1,
@@ -243,11 +253,15 @@ def main(args=None):
         # "joint"（預設、已驗證）或 "cartesian"（逐 tick 現場解 IK，見 README）。
         control_space="joint",
 
-        # cartesian 模式必填的關節角速度/加速度上限，安全關鍵。以下數字**還沒有
+        # 兩種 control_space 都必填的關節角速度上限，安全關鍵。以下數字**還沒有
         # 像 max_pos_speed/max_rot_speed 那樣實測確認過**，用之前先核對教導器
         # Installation 設定/payload 限制。
-        max_joint_speed=6.2832,          # rad/s (180deg/s)，未實測確認
-        max_joint_acceleration=6.0,      # rad/s^2，未實測確認
+        max_joint_speed=3.33,          # rad/s (180deg/s)，未實測確認
+
+        # 指令加速度平滑常數，安全關鍵——教導器 Installation 沒有對應的規格值可以
+        # 核對（見 dp_controller.py 裡 joint_accel_limit 的註解），先給保守值觀察
+        # 還會不會跳 Protective Stop，確認穩定後再視情況調高。
+        joint_accel_limit=2.0,         # rad/s^2，保守起始值，未實測
 
         run_duration_seconds=30.0,   # 示範用安全上限，跑這麼久自動停止（Ctrl+C 也可隨時中止）
 
